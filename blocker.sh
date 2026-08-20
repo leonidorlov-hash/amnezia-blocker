@@ -1,5 +1,6 @@
 #!/bin/bash
-# Amnezia Blocker Manager v3.1 (IPv4 + IPv6 + TCP RST + flock + parallel DNS)
+# Amnezia Blocker Manager v3.1.1 (IPv4 + IPv6 + TCP RST + flock + parallel DNS)
+# v3.1.1 hotfix: xargs без -I (конфликт с -n), дочерние dig не валят set -e
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 set -e
 
@@ -149,14 +150,17 @@ update_blocks() {
     export AB_TMP4="$tmp4" AB_TMP6="$tmp6" AB_IPV6="$has_ipv6"
 
     local started=$SECONDS
+    # Дочерний процесс всегда завершается с кодом 0: домен без A/AAAA-записи
+    # не должен валить всё обновление через set -e
     grep -vE '^\s*(#|$)' "$DOMAINS_FILE" | sed 's/^\*\.//' | sort -u | \
-    xargs -P "$DNS_JOBS" -n 1 -I{} bash -c '
+    xargs -P "$DNS_JOBS" -n 1 bash -c '
         d="$1"
-        dig +short +timeout=2 +tries=1 A "$d" 2>/dev/null | grep -E "^[0-9.]+$" >> "$AB_TMP4"
+        dig +short +timeout=2 +tries=1 A "$d" 2>/dev/null | grep -E "^[0-9.]+$" >> "$AB_TMP4" || true
         if [ "$AB_IPV6" = true ]; then
-            dig +short +timeout=2 +tries=1 AAAA "$d" 2>/dev/null | grep -E "^[0-9a-fA-F:]+$" >> "$AB_TMP6"
+            dig +short +timeout=2 +tries=1 AAAA "$d" 2>/dev/null | grep -E "^[0-9a-fA-F:]+$" >> "$AB_TMP6" || true
         fi
-    ' _ {}
+        exit 0
+    ' _ || true
     log "DNS-резолв завершён за $((SECONDS - started)) сек ($DNS_JOBS потоков)"
 
     # Заливка в temp-сеты одной транзакцией (в сотни раз быстрее, чем ipset add в цикле)
