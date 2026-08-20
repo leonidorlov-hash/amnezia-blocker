@@ -1,6 +1,6 @@
 #!/bin/bash
-# Amnezia Blocker Manager v3.1.1 (IPv4 + IPv6 + TCP RST + flock + parallel DNS)
-# v3.1.1 hotfix: xargs без -I (конфликт с -n), дочерние dig не валят set -e
+# Amnezia Blocker Manager v3.2 (IPv4 + IPv6 + TCP RST + flock + parallel DNS + progress)
+# v3.2: живой прогресс резолва в консоль (домены X/Y, счётчики IP), этапы в лог
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 set -e
 
@@ -146,29 +146,44 @@ update_blocks() {
     fi
 
     local tmp4="/tmp/ab_res4.$$" tmp6="/tmp/ab_res6.$$"
-    : > "$tmp4"; : > "$tmp6"
-    export AB_TMP4="$tmp4" AB_TMP6="$tmp6" AB_IPV6="$has_ipv6"
+    local dlist="/tmp/ab_domains.$$" prog="/tmp/ab_prog.$$"
+    : > "$tmp4"; : > "$tmp6"; : > "$prog"
+
+    grep -vE '^\s*(#|$)' "$DOMAINS_FILE" | sed 's/^\*\.//' | sort -u > "$dlist" || true
+    local total
+    total=$(wc -l < "$dlist")
+    log "Доменов в списке: $total, потоков: $DNS_JOBS"
+
+    export AB_TMP4="$tmp4" AB_TMP6="$tmp6" AB_IPV6="$has_ipv6" AB_PROG="$prog"
 
     local started=$SECONDS
     # Дочерний процесс всегда завершается с кодом 0: домен без A/AAAA-записи
     # не должен валить всё обновление через set -e
-    grep -vE '^\s*(#|$)' "$DOMAINS_FILE" | sed 's/^\*\.//' | sort -u | \
     xargs -P "$DNS_JOBS" -n 1 bash -c '
         d="$1"
         dig +short +timeout=2 +tries=1 A "$d" 2>/dev/null | grep -E "^[0-9.]+$" >> "$AB_TMP4" || true
         if [ "$AB_IPV6" = true ]; then
             dig +short +timeout=2 +tries=1 AAAA "$d" 2>/dev/null | grep -E "^[0-9a-fA-F:]+$" >> "$AB_TMP6" || true
         fi
+        echo . >> "$AB_PROG"
         exit 0
-    ' _ || true
-    log "DNS-резолв завершён за $((SECONDS - started)) сек ($DNS_JOBS потоков)"
+    ' _ < "$dlist" &
+    local xpid=$!
+
+    # Живой прогресс в консоль каждые 5 сек (в лог-файл не пишем, чтобы не спамить при cron)
+    while kill -0 "$xpid" 2>/dev/null; do
+        echo "$(date '+%T') Доменов: $(wc -l < "$prog" 2>/dev/null || echo 0)/$total | IPv4: $(wc -l < "$tmp4" 2>/dev/null || echo 0) | IPv6: $(wc -l < "$tmp6" 2>/dev/null || echo 0)"
+        sleep 5
+    done
+    wait "$xpid" || true
+    log "DNS-резолв завершён за $((SECONDS - started)) сек: $(wc -l < "$tmp4" 2>/dev/null || echo 0) IPv4, $(wc -l < "$tmp6" 2>/dev/null || echo 0) IPv6"
 
     # Заливка в temp-сеты одной транзакцией (в сотни раз быстрее, чем ipset add в цикле)
     sort -u "$tmp4" | sed "s|^|add ${BLOCKSET4}_temp |" | ipset restore -exist 2>/dev/null || true
     if [ "$has_ipv6" = true ]; then
         sort -u "$tmp6" | sed "s|^|add ${BLOCKSET6}_temp |" | ipset restore -exist 2>/dev/null || true
     fi
-    rm -f "$tmp4" "$tmp6"
+    rm -f "$tmp4" "$tmp6" "$dlist" "$prog"
 
     local temp4_count
     temp4_count=$(ipset list "${BLOCKSET4}_temp" 2>/dev/null | grep -c '^[0-9]') || temp4_count=0
