@@ -65,7 +65,9 @@ ensure_deps() {
 # --- ipset helpers -----------------------------------------------------------
 
 create_set() { # $1=name $2=family(inet|inet6)
-    ipset create "$1" hash:net "family $2" maxelem $MAXELEM 2>/dev/null || true
+    # ВАЖНО: family и inet — ДВА отдельных аргумента; "family inet" одним словом
+    # ipset 7.x отвергает с "Unknown argument".
+    ipset create "$1" hash:net family "$2" maxelem $MAXELEM 2>/dev/null || true
 }
 
 # Атомарная перезаливка: скачать, вытащить 'add'-строки, залить в _tmp, swap.
@@ -88,7 +90,7 @@ swap_list() { # $1=url $2=set_name $3=family
         tr -d '\r' < "$tmp" | grep '^add ' | sed "s|^add [^ ]*|add ${set}_tmp|"
     } > "$restore"
     local cerr
-    cerr=$(ipset create "$set" hash:net "family $family" maxelem $MAXELEM 2>&1) \
+    cerr=$(ipset create "$set" hash:net family "$family" maxelem $MAXELEM 2>&1) \
         || log "CREATE-WARN $set: $cerr"
     ipset destroy "${set}_tmp" 2>/dev/null
     if ! ipset restore -exist < "$restore" 2>>"$LOG_FILE"; then
@@ -222,16 +224,26 @@ build_chains() {
 cmd_update() {
     load_config
     swap_list "$URL_IN4" "$IN_SET4" inet
-    swap_list "$URL_IN6" "$IN_SET6" inet6
+    if have6; then
+        swap_list "$URL_IN6" "$IN_SET6" inet6
+    else
+        log "SKIP $IN_SET6: на хосте нет IPv6"
+    fi
     swap_list "$URL_OUT4" "$OUT_SET4" inet
-    swap_list "$URL_OUT6" "$OUT_SET6" inet6
+    if have6; then
+        swap_list "$URL_OUT6" "$OUT_SET6" inet6
+    else
+        log "SKIP $OUT_SET6: на хосте нет IPv6"
+    fi
     mkdir -p "$CONF_DIR"
     build_map "$URL_MAP" "$CONF_DIR/nets.map"
 }
 
 cmd_on() {
-    create_set "$IN_SET4" inet; create_set "$IN_SET6" inet6
-    create_set "$OUT_SET4" inet; create_set "$OUT_SET6" inet6
+    create_set "$IN_SET4" inet
+    if have6; then create_set "$IN_SET6" inet6; fi
+    create_set "$OUT_SET4" inet
+    if have6; then create_set "$OUT_SET6" inet6; fi
     # Если наборы пустые (первый запуск / после ребута) — подгрузить
     local n; n=$(ipset list "$IN_SET4" 2>/dev/null | grep -c '^[0-9]')
     [ "$n" -lt 1 ] && cmd_update
