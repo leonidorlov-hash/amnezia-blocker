@@ -8,7 +8,8 @@ TMP=$(mktemp -d)
 trap 'rm -rf "$TMP"' EXIT
 
 apt-get update -qq
-apt-get install -y -qq ipset iptables curl flock >/dev/null
+apt-get install -y -qq ipset iptables curl util-linux >/dev/null
+command -v flock >/dev/null || { echo "flock not found (util-linux)" >&2; exit 1; }
 
 git clone -q --depth 1 "$REPO" "$TMP/repo" 2>/dev/null || {
     # git может быть не нужен: тянем файлы напрямую
