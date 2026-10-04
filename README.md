@@ -104,3 +104,9 @@ rkn-extra-block scan /var/log/nginx/access.log /var/log/auth.log*
 ```
 
 `scan` матчит IP логов против текущих ipset-наборов (in4+out4) и показывает топ адресов с примерами строк. Журналирование по умолчанию выключено (DROP/REJECT молчаливые), включение не влияет на производительность — `-m limit` 10/мин.
+
+### Статистика сканов для панели (v1.2)
+
+- `rkn-extra-block update` теперь строит `/etc/rkn-extra-block/nets.map` — маппинг сети → ведомство из `blacklist_with_comments.txt`.
+- `rkn-agent-collect` (systemd timer `rkn-agent.timer`, ежечасно): агрегирует `journalctl -k -g RKN_EXTRA` за час, матчит SRC-IP против nets.map, пишет компактный JSON в `/var/log/rkn-scans.json`, подрезает до 5000 строк. Требует `rkn-extra-block log on` (инсталлятор включает сам).
+- Формат строки: `{"t":"...","dir":"in|out|in6|out6","ip":"...","dpt":443,"org":"VKONTAKTE-SPB-AS (LLC VK)"}`. Панель читает этот файл по SSH.

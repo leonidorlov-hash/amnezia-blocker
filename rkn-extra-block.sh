@@ -50,6 +50,7 @@ load_config() {
     URL_IN6="https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists_iptables/blacklist-v6.ipset"
     URL_OUT4="https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists_iptables/blacklist-vk-v4.ipset"
     URL_OUT6="https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists_iptables/blacklist-vk-v6.ipset"
+    URL_MAP="https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists/blacklist_with_comments.txt"
     [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
 }
 
@@ -101,6 +102,49 @@ swap_list() { # $1=url $2=set_name $3=family
 }
 
 # --- firewall ----------------------------------------------------------------
+# Строит /etc/rkn-extra-block/nets.map: "firstPadded\tlastPadded\tlabel" на каждую
+# IPv4-сеть из blacklist_with_comments.txt. Label — из секций AS-Name (читаемое имя)
+# или MNT-токенов NET-Name (напр. VKCOMPANY). Нужен агенту статистики (rkn-agent).
+build_map() {
+    local url="$1" out="$2"
+    local tmp; tmp=$(mktemp) || die "mktemp"
+    if ! curl -fsS --max-time 90 "$url" -o "$tmp"; then
+        log "MAP-FAIL: не скачался $url — старый nets.map сохранён"
+        rm -f "$tmp"; return 1
+    fi
+    tr -d '\r' < "$tmp" | awk -F'\t' -v OFS='\t' '
+    function pad(o) { return sprintf("%03d.%03d.%03d.%03d", o[1], o[2], o[3], o[4]) }
+    function emit(net, lbl,   a, p, full, bits, step, i, lo, hi) {
+        gsub(/\//, ".", net); split(net, a, ".")
+        p = a[5] + 0; full = int(p / 8); bits = p % 8
+        step = 1; for (i = 0; i < 8 - bits; i++) step *= 2
+        for (i = 1; i <= 4; i++) { lo[i] = 0; hi[i] = 255 }
+        for (i = 1; i <= full; i++) { lo[i] = a[i]; hi[i] = a[i] }
+        if (bits > 0) {
+            lo[full + 1] = int(a[full + 1] / step) * step
+            hi[full + 1] = lo[full + 1] + step - 1
+        }
+        print pad(lo), pad(hi), lbl
+    }
+    /^# AS-Name \(ORG\): / { label = substr($0, index($0, ": ") + 2); next }
+    /^# AS-Name: /         { label = substr($0, index($0, ": ") + 2); next }
+    /^# NET-Name: / {
+        rest = substr($0, index($0, ": ") + 2)
+        sub(/^[^ ]+ /, "", rest)
+        gsub(/\([^)]*\)/, "", rest); gsub(/[\[\]]/, "", rest)
+        n = split(rest, t, /[ \t]+/); lbl = ""
+        for (i = 1; i <= n; i++) if (t[i] ~ /MNT/) { x = t[i]; sub(/-MNT$/, "", x); lbl = lbl (lbl ? " " : "") x }
+        label = (lbl ? lbl : "C24Be " substr(rest, 1, 40))
+        next
+    }
+    /^#/ { next }
+    /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+\/[0-9]+/ { emit($1, label) }
+    ' > "$out.tmp"
+    mv "$out.tmp" "$out"
+    rm -f "$tmp"
+    log "MAP-OK: $(wc -l < "$out") сетей с метками"
+    return 0
+}
 
 apply_jumps() {
     iptables -C INPUT -j "$IN_CHAIN" 2>/dev/null || iptables -I INPUT 1 -j "$IN_CHAIN"
@@ -175,6 +219,8 @@ cmd_update() {
     swap_list "$URL_IN6" "$IN_SET6" inet6
     swap_list "$URL_OUT4" "$OUT_SET4" inet
     swap_list "$URL_OUT6" "$OUT_SET6" inet6
+    mkdir -p "$CONF_DIR"
+    build_map "$URL_MAP" "$CONF_DIR/nets.map"
 }
 
 cmd_on() {

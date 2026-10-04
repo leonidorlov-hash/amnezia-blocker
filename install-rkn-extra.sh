@@ -13,14 +13,18 @@ apt-get install -y -qq ipset iptables curl flock >/dev/null
 git clone -q --depth 1 "$REPO" "$TMP/repo" 2>/dev/null || {
     # git может быть не нужен: тянем файлы напрямую
     mkdir -p "$TMP/repo"
-    for f in rkn-extra-block.sh rkn-extra-block.service rkn-extra-block.timer; do
+    for f in rkn-extra-block.sh rkn-extra-block.service rkn-extra-block.timer \
+             rkn-agent.sh rkn-agent.service rkn-agent.timer; do
         curl -fsSL "$REPO/raw/main/$f" -o "$TMP/repo/$f"
     done
 }
 
 install -m 0755 "$TMP/repo/rkn-extra-block.sh" /usr/local/sbin/rkn-extra-block
+install -m 0755 "$TMP/repo/rkn-agent.sh" /usr/local/sbin/rkn-agent-collect
 install -m 0644 "$TMP/repo/rkn-extra-block.service" /etc/systemd/system/rkn-extra-block.service
 install -m 0644 "$TMP/repo/rkn-extra-block.timer" /etc/systemd/system/rkn-extra-block.timer
+install -m 0644 "$TMP/repo/rkn-agent.service" /etc/systemd/system/rkn-agent.service
+install -m 0644 "$TMP/repo/rkn-agent.timer" /etc/systemd/system/rkn-agent.timer
 
 mkdir -p /etc/rkn-extra-block
 [ -f /etc/rkn-extra-block/config ] || cat > /etc/rkn-extra-block/config <<'EOF'
@@ -34,8 +38,14 @@ EOF
 systemctl daemon-reload
 systemctl enable --now rkn-extra-block.timer
 systemctl enable rkn-extra-block.service
+systemctl enable --now rkn-agent.timer
 
-# Первый запуск: подгрузить списки и включить
+# Первый запуск: подгрузить списки (включая nets.map для агента) и включить
 /usr/local/sbin/rkn-extra-block on
 
-echo "Готово. Управление: rkn-extra-block {on|off|status|update}"
+# Статистике нужны LOG-правила: включаем журналирование (пересобирает цепочки)
+/usr/local/sbin/rkn-extra-block log on || true
+
+touch /var/log/rkn-scans.json
+
+echo "Готово. Управление: rkn-extra-block {on|off|status|update} | log on|off | scan"
