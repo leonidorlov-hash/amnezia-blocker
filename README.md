@@ -65,3 +65,31 @@ iptables -L AMNEZIA_BLOCK -n               # правила цепи
 ## Серверы
 
 Развёрнуто на: EUROBYTE, FIRSTBYTE, IHOR, NATA, RAHMET, fastvps, mrak (все — v3.2 + cron, 2026-08-20).
+
+## rkn-extra-block — дополнительный контур по спискам C24Be/AS_Network_List
+
+Доменный `blocker.sh` закрывает конкретные домены. `rkn-extra-block` добавляет два контура по подсетям из ежедневно обновляемых списков [C24Be/AS_Network_List](https://github.com/C24Be/AS_Network_List):
+
+- **входящие** (`RKN_EXTRA_IN`, ipset `rkn_extra_in4/6`): подсети РКН/гос-структур → `DROP` новых соединений в `INPUT` (и ip6tables);
+- **исходящие** (`RKN_EXTRA_OUT`, ipset `rkn_extra_out4/6`): сети VK/Max/OK → `REJECT tcp-reset` в `OUTPUT` + `FORWARD` (трафик VPN-клиентов тоже).
+
+Контуры независимы от `AMNEZIA_BLOCK` — включаются/выключаются отдельно.
+
+### Установка (root, Debian/Ubuntu)
+
+```bash
+wget -qO- https://raw.githubusercontent.com/leonidorlov-hash/amnezia-blocker/main/install-rkn-extra.sh | bash
+```
+
+Ставит `rkn-extra-block` в `/usr/local/sbin`, конфиг в `/etc/rkn-extra-block/config`, systemd-сервис (восстановление при загрузке) и таймер (ежедневное обновление списков, `daily` + случайная задержка до 2ч).
+
+### Команды
+
+```bash
+rkn-extra-block on      # включить
+rkn-extra-block off     # выключить (наборы сохраняются — повторный on мгновенный)
+rkn-extra-block status  # состояние, размеры списков, наличие правил
+rkn-extra-block update  # принудительно обновить списки
+```
+
+Обновление атомарное: список заливается во временный ipset и swap'ится; при сбое скачивания старый набор сохраняется.

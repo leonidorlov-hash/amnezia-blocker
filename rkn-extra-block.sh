@@ -1,0 +1,217 @@
+#!/usr/bin/env bash
+# rkn-extra-block — дополнительная блокировка по спискам C24Be/AS_Network_List.
+# Два независимых от amnezia-blocker контуры:
+#   IN  (RKN_EXTRA_IN):  подсети РКН/гос-структур — ВХОДЯЩИЕ соединения (INPUT, DROP NEW)
+#   OUT (RKN_EXTRA_OUT): сети VK/Max/OK — ИСХОДЯЩИЕ (OUTPUT + FORWARD, REJECT tcp-reset)
+# Списки обновляются ежедневно (systemd timer), заливка в ipset атомарная (temp -> swap).
+#
+# Команды: on | off | status | update | boot
+#   on      — включить (подгрузить списки если пустые, повесить прыжки в цепочки)
+#   off     — выключить (снять прыжки; наборы ipset сохраняются для мгновенного on)
+#   status  — состояние, размеры наборов, наличие правил
+#   update  — скачать свежие списки и атомарно перезалить наборы
+#   boot    — вызывается systemd при старте (update + восстановить прыжки если state=on)
+
+set -u
+
+CONF_DIR="/etc/rkn-extra-block"
+STATE_FILE="$CONF_DIR/state"
+LOG_FILE="/var/log/rkn-extra-block.log"
+LOCK_FILE="/run/rkn-extra-block.lock"
+CONFIG_FILE="$CONF_DIR/config"
+
+IN_CHAIN="RKN_EXTRA_IN"
+OUT_CHAIN="RKN_EXTRA_OUT"
+IN_SET4="rkn_extra_in4"
+IN_SET6="rkn_extra_in6"
+OUT_SET4="rkn_extra_out4"
+OUT_SET6="rkn_extra_out6"
+
+# Максимальные размеры с запасом (сейчас: in4 ~1151, out4 ~204 сетей)
+MAXELEM=65536
+
+log() { echo "$(date '+%Y-%m-%d %H:%M:%S') $*" >> "$LOG_FILE"; }
+die() { echo "ERROR: $*" >&2; log "ERROR: $*"; exit 1; }
+
+lock() {
+    exec 9>"$LOCK_FILE" || die "не удалось открыть $LOCK_FILE"
+    flock -n 9 || die "другой экземпляр rkn-extra-block уже работает"
+}
+
+get_state() { [ -f "$STATE_FILE" ] && cat "$STATE_FILE" || echo "off"; }
+set_state() { echo "$1" > "$STATE_FILE"; }
+
+load_config() {
+    # Значения по умолчанию; переопределяются /etc/rkn-extra-block/config
+    URL_IN4="https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists_iptables/blacklist-v4.ipset"
+    URL_IN6="https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists_iptables/blacklist-v6.ipset"
+    URL_OUT4="https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists_iptables/blacklist-vk-v4.ipset"
+    URL_OUT6="https://raw.githubusercontent.com/C24Be/AS_Network_List/main/blacklists_iptables/blacklist-vk-v6.ipset"
+    [ -f "$CONFIG_FILE" ] && . "$CONFIG_FILE"
+}
+
+have6() { command -v ip6tables &>/dev/null && [ -e /proc/net/if_inet6 ]; }
+
+ensure_deps() {
+    for d in ipset iptables curl flock; do
+        command -v "$d" &>/dev/null || die "нет зависимости: $d (apt install ipset iptables curl)"
+    done
+}
+
+# --- ipset helpers -----------------------------------------------------------
+
+create_set() { # $1=name $2=family(inet|inet6)
+    ipset create "$1" hash:net "family $2" maxelem $MAXELEM 2>/dev/null || true
+}
+
+# Атомарная перезаливка: скачать, вытащить 'add'-строки, залить в _tmp, swap.
+# При любом провале старый набор остаётся нетронутым.
+swap_list() { # $1=url $2=set_name $3=family
+    local url="$1" set="$2" family="$3"
+    local tmp; tmp=$(mktemp) || die "mktemp"
+    if ! curl -fsS --max-time 90 "$url" -o "$tmp"; then
+        log "SWAP-FAIL $set: не скачался $url — старый набор сохранён"
+        rm -f "$tmp"; return 1
+    fi
+    local adds; adds=$(grep -c '^add ' "$tmp")
+    if [ "$adds" -lt 1 ]; then
+        log "SWAP-FAIL $set: в $url 0 записей — старый набор сохранён"
+        rm -f "$tmp"; return 1
+    fi
+    local restore; restore=$(mktemp) || die "mktemp"
+    {
+        echo "create ${set}_tmp hash:net family $family maxelem $MAXELEM"
+        tr -d '\r' < "$tmp" | grep '^add ' | sed "s|^add [^ ]*|add ${set}_tmp|"
+    } > "$restore"
+    create_set "$set" "$family"
+    ipset destroy "${set}_tmp" 2>/dev/null
+    if ! ipset restore -exist < "$restore" 2>/dev/null; then
+        log "SWAP-FAIL $set: ipset restore вернул ошибку — старый набор сохранён"
+        ipset destroy "${set}_tmp" 2>/dev/null
+        rm -f "$tmp" "$restore"; return 1
+    fi
+    ipset swap "${set}_tmp" "$set"
+    ipset destroy "${set}_tmp" 2>/dev/null
+    rm -f "$tmp" "$restore"
+    log "SWAP-OK $set: $adds сетей"
+    return 0
+}
+
+# --- firewall ----------------------------------------------------------------
+
+apply_jumps() {
+    iptables -C INPUT -j "$IN_CHAIN" 2>/dev/null || iptables -I INPUT 1 -j "$IN_CHAIN"
+    iptables -C OUTPUT -j "$OUT_CHAIN" 2>/dev/null || iptables -I OUTPUT 1 -j "$OUT_CHAIN"
+    iptables -C FORWARD -j "$OUT_CHAIN" 2>/dev/null || iptables -I FORWARD 1 -j "$OUT_CHAIN"
+    if have6; then
+        ip6tables -C INPUT -j "$IN_CHAIN" 2>/dev/null || ip6tables -I INPUT 1 -j "$IN_CHAIN" 2>/dev/null
+        ip6tables -C OUTPUT -j "$OUT_CHAIN" 2>/dev/null || ip6tables -I OUTPUT 1 -j "$OUT_CHAIN" 2>/dev/null
+        ip6tables -C FORWARD -j "$OUT_CHAIN" 2>/dev/null || ip6tables -I FORWARD 1 -j "$OUT_CHAIN" 2>/dev/null
+    fi
+}
+
+remove_jumps() {
+    while iptables -C INPUT -j "$IN_CHAIN" 2>/dev/null; do iptables -D INPUT -j "$IN_CHAIN"; done
+    while iptables -C OUTPUT -j "$OUT_CHAIN" 2>/dev/null; do iptables -D OUTPUT -j "$OUT_CHAIN"; done
+    while iptables -C FORWARD -j "$OUT_CHAIN" 2>/dev/null; do iptables -D FORWARD -j "$OUT_CHAIN"; done
+    if have6; then
+        while ip6tables -C INPUT -j "$IN_CHAIN" 2>/dev/null; do ip6tables -D INPUT -j "$IN_CHAIN"; done
+        while ip6tables -C OUTPUT -j "$OUT_CHAIN" 2>/dev/null; do ip6tables -D OUTPUT -j "$OUT_CHAIN"; done
+        while ip6tables -C FORWARD -j "$OUT_CHAIN" 2>/dev/null; do ip6tables -D FORWARD -j "$OUT_CHAIN"; done
+    fi
+}
+
+build_chains() {
+    iptables -N "$IN_CHAIN" 2>/dev/null || true
+    iptables -F "$IN_CHAIN"
+    # Входящие от РКН-подсетей: тишина (DROP), только новые соединения
+    iptables -A "$IN_CHAIN" -m set --match-set "$IN_SET4" src -m conntrack --ctstate NEW -j DROP
+
+    iptables -N "$OUT_CHAIN" 2>/dev/null || true
+    iptables -F "$OUT_CHAIN"
+    # Исходящие к VK/Max/OK: штатный обрыв как в amnezia-blocker (REJECT)
+    iptables -A "$OUT_CHAIN" -p tcp -m set --match-set "$OUT_SET4" dst -j REJECT --reject-with tcp-reset
+    iptables -A "$OUT_CHAIN" -m set --match-set "$OUT_SET4" dst -j REJECT
+
+    if have6; then
+        ip6tables -N "$IN_CHAIN" 2>/dev/null || true
+        ip6tables -F "$IN_CHAIN" 2>/dev/null
+        ip6tables -A "$IN_CHAIN" -m set --match-set "$IN_SET6" src -m conntrack --ctstate NEW -j DROP 2>/dev/null
+
+        ip6tables -N "$OUT_CHAIN" 2>/dev/null || true
+        ip6tables -F "$OUT_CHAIN" 2>/dev/null
+        ip6tables -A "$OUT_CHAIN" -p tcp -m set --match-set "$OUT_SET6" dst -j REJECT --reject-with tcp-reset 2>/dev/null
+        ip6tables -A "$OUT_CHAIN" -m set --match-set "$OUT_SET6" dst -j REJECT 2>/dev/null
+    fi
+}
+
+# --- commands ----------------------------------------------------------------
+
+cmd_update() {
+    load_config
+    swap_list "$URL_IN4" "$IN_SET4" inet
+    swap_list "$URL_IN6" "$IN_SET6" inet6
+    swap_list "$URL_OUT4" "$OUT_SET4" inet
+    swap_list "$URL_OUT6" "$OUT_SET6" inet6
+}
+
+cmd_on() {
+    create_set "$IN_SET4" inet; create_set "$IN_SET6" inet6
+    create_set "$OUT_SET4" inet; create_set "$OUT_SET6" inet6
+    # Если наборы пустые (первый запуск / после ребута) — подгрузить
+    local n; n=$(ipset list "$IN_SET4" 2>/dev/null | grep -c '^[0-9]')
+    [ "$n" -lt 1 ] && cmd_update
+    build_chains
+    apply_jumps
+    set_state on
+    log "ON"
+    echo "rkn-extra-block: ON"
+    cmd_status_short
+}
+
+cmd_off() {
+    remove_jumps
+    set_state off
+    log "OFF"
+    echo "rkn-extra-block: OFF (наборы ipset сохранены, повторное включение мгновенное)"
+}
+
+set_count() { ipset list "$1" 2>/dev/null | grep -c '^[0-9]'; }
+
+cmd_status() {
+    local st; st=$(get_state)
+    local in4 in6 out4 out6
+    in4=$(set_count "$IN_SET4"); in6=$(set_count "$IN_SET6")
+    out4=$(set_count "$OUT_SET4"); out6=$(set_count "$OUT_SET6")
+    echo "rkn_extra_block: $st"
+    echo "  входящие (РКН, DROP NEW):  v4=$in4 сетей  v6=$in6 сетей"
+    echo "  исходящие (VK/Max, REJECT): v4=$out4 сетей  v6=$out6 сетей"
+    if iptables -C INPUT -j "$IN_CHAIN" 2>/dev/null; then echo "  правила: iptables INPUT/OUTPUT/FORWARD — вешаются"; else echo "  правила: СНЯТЫ (блокировка неактивна)"; fi
+    have6 && ip6tables -C INPUT -j "$IN_CHAIN" 2>/dev/null && echo "  правила v6: вешаются"
+}
+
+cmd_status_short() {
+    echo "  in4=$(set_count "$IN_SET4") in6=$(set_count "$IN_SET6") out4=$(set_count "$OUT_SET4") out6=$(set_count "$OUT_SET6")"
+}
+
+cmd_boot() {
+    load_config
+    ensure_deps
+    cmd_update
+    if [ "$(get_state)" = "on" ]; then
+        build_chains
+        apply_jumps
+        log "BOOT: восстановлено состояние ON"
+    else
+        log "BOOT: состояние OFF, только наборы обновлены"
+    fi
+}
+
+case "${1:-}" in
+    on)      lock; ensure_deps; cmd_on ;;
+    off)     lock; ensure_deps; cmd_off ;;
+    status)  cmd_status ;;
+    update)  lock; ensure_deps; cmd_update; cmd_status_short ;;
+    boot)    lock; cmd_boot ;;
+    *) echo "Использование: rkn-extra-block {on|off|status|update|boot}" >&2; exit 2 ;;
+esac
