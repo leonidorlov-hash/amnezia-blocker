@@ -5,17 +5,20 @@
 #   OUT (RKN_EXTRA_OUT): сети VK/Max/OK — ИСХОДЯЩИЕ (OUTPUT + FORWARD, REJECT tcp-reset)
 # Списки обновляются ежедневно (systemd timer), заливка в ipset атомарная (temp -> swap).
 #
-# Команды: on | off | status | update | boot
+# Команды: on | off | status | update | boot | log on|off|status | scan [файлы...]
 #   on      — включить (подгрузить списки если пустые, повесить прыжки в цепочки)
 #   off     — выключить (снять прыжки; наборы ipset сохраняются для мгновенного on)
 #   status  — состояние, размеры наборов, наличие правил
 #   update  — скачать свежие списки и атомарно перезалить наборы
 #   boot    — вызывается systemd при старте (update + восстановить прыжки если state=on)
+#   log on  — журналировать срабатывания (journalctl -k -g RKN_EXTRA), по умолчанию ВЫКЛ
+#   scan    — ретроспектива: найти IP из списков в логах (по умолчанию nginx/auth)
 
 set -u
 
 CONF_DIR="/etc/rkn-extra-block"
 STATE_FILE="$CONF_DIR/state"
+LOG_STATE_FILE="$CONF_DIR/log_state"
 LOG_FILE="/var/log/rkn-extra-block.log"
 LOCK_FILE="/run/rkn-extra-block.lock"
 CONFIG_FILE="$CONF_DIR/config"
@@ -122,13 +125,24 @@ remove_jumps() {
 }
 
 build_chains() {
+    local logging="no"
+    [ -f "$LOG_STATE_FILE" ] && [ "$(cat "$LOG_STATE_FILE")" = "on" ] && logging="yes"
+
     iptables -N "$IN_CHAIN" 2>/dev/null || true
     iptables -F "$IN_CHAIN"
+    if [ "$logging" = "yes" ]; then
+        iptables -A "$IN_CHAIN" -m set --match-set "$IN_SET4" src -m conntrack --ctstate NEW \
+            -m limit --limit 10/min -j LOG --log-prefix "RKN_EXTRA_IN " --log-level 4
+    fi
     # Входящие от РКН-подсетей: тишина (DROP), только новые соединения
     iptables -A "$IN_CHAIN" -m set --match-set "$IN_SET4" src -m conntrack --ctstate NEW -j DROP
 
     iptables -N "$OUT_CHAIN" 2>/dev/null || true
     iptables -F "$OUT_CHAIN"
+    if [ "$logging" = "yes" ]; then
+        iptables -A "$OUT_CHAIN" -p tcp -m set --match-set "$OUT_SET4" dst \
+            -m limit --limit 10/min -j LOG --log-prefix "RKN_EXTRA_OUT " --log-level 4
+    fi
     # Исходящие к VK/Max/OK: штатный обрыв как в amnezia-blocker (REJECT)
     iptables -A "$OUT_CHAIN" -p tcp -m set --match-set "$OUT_SET4" dst -j REJECT --reject-with tcp-reset
     iptables -A "$OUT_CHAIN" -m set --match-set "$OUT_SET4" dst -j REJECT
@@ -136,10 +150,18 @@ build_chains() {
     if have6; then
         ip6tables -N "$IN_CHAIN" 2>/dev/null || true
         ip6tables -F "$IN_CHAIN" 2>/dev/null
+        if [ "$logging" = "yes" ]; then
+            ip6tables -A "$IN_CHAIN" -m set --match-set "$IN_SET6" src -m conntrack --ctstate NEW \
+                -m limit --limit 10/min -j LOG --log-prefix "RKN_EXTRA_IN6 " --log-level 4 2>/dev/null
+        fi
         ip6tables -A "$IN_CHAIN" -m set --match-set "$IN_SET6" src -m conntrack --ctstate NEW -j DROP 2>/dev/null
 
         ip6tables -N "$OUT_CHAIN" 2>/dev/null || true
         ip6tables -F "$OUT_CHAIN" 2>/dev/null
+        if [ "$logging" = "yes" ]; then
+            ip6tables -A "$OUT_CHAIN" -p tcp -m set --match-set "$OUT_SET6" dst \
+                -m limit --limit 10/min -j LOG --log-prefix "RKN_EXTRA_OUT6 " --log-level 4 2>/dev/null
+        fi
         ip6tables -A "$OUT_CHAIN" -p tcp -m set --match-set "$OUT_SET6" dst -j REJECT --reject-with tcp-reset 2>/dev/null
         ip6tables -A "$OUT_CHAIN" -m set --match-set "$OUT_SET6" dst -j REJECT 2>/dev/null
     fi
@@ -207,11 +229,102 @@ cmd_boot() {
     fi
 }
 
+cmd_log() {
+    case "${1:-}" in
+        on)
+            mkdir -p "$CONF_DIR"
+            echo on > "$LOG_STATE_FILE"
+            build_chains   # пересобрать цепочки с LOG-правилами (прыжки не трогаем)
+            log "LOGGING ON"
+            echo "Журналирование ВКЛ — срабатывания: journalctl -k -g RKN_EXTRA (лимит 10/мин)"
+            ;;
+        off)
+            echo off > "$LOG_STATE_FILE"
+            build_chains
+            log "LOGGING OFF"
+            echo "Журналирование ВЫКЛ"
+            ;;
+        status|*)
+            local st="off"
+            [ -f "$LOG_STATE_FILE" ] && st=$(cat "$LOG_STATE_FILE")
+            echo "rkn_extra_block logging: $st"
+            ;;
+    esac
+}
+
+# Ретроспектива: найти в лог-файлах IP, входящие в текущие наборы rkn-extra-block.
+# Использование: rkn-extra-block scan [файл...]  (умолчание: access.log nginx + auth.log)
+cmd_scan() {
+    command -v python3 &>/dev/null || die "нужен python3"
+    local files=("$@")
+    [ "${#files[@]}" -eq 0 ] && files=(/var/log/nginx/access.log /var/log/auth.log)
+    IN_SET4="$IN_SET4" OUT_SET4="$OUT_SET4" python3 - "${files[@]}" << 'PYEOF'
+import collections, gzip, ipaddress, os, re, subprocess, sys
+
+in_set = os.environ["IN_SET4"]; out_set = os.environ["OUT_SET4"]
+out = subprocess.run(["ipset", "save"], capture_output=True, text=True).stdout
+nets = []
+for line in out.splitlines():
+    parts = line.split()
+    if len(parts) >= 3 and parts[0] == "add" and parts[1] in (in_set, out_set):
+        try:
+            nets.append(ipaddress.ip_network(parts[2]))
+        except ValueError:
+            pass
+by_first = collections.defaultdict(list)
+for n in nets:
+    by_first[n.network_address.packed[0] if n.version == 4 else 0].append(n)
+
+ip_re = re.compile(r"\b(\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3})\b")
+hits = collections.Counter()
+samples = {}
+total = matched = 0
+for path in sys.argv[1:]:
+    paths = [path]
+    if path.endswith("*"):
+        import glob
+        paths = sorted(glob.glob(path))
+    for p in paths:
+        if not os.path.exists(p):
+            continue
+        opener = gzip.open if p.endswith(".gz") else open
+        try:
+            with opener(p, "rt", errors="replace") as fh:
+                for line in fh:
+                    total += 1
+                    m = ip_re.search(line)
+                    if not m:
+                        continue
+                    try:
+                        ip = ipaddress.ip_address(m.group(1))
+                    except ValueError:
+                        continue
+                    for n in by_first.get(ip.packed[0], ()):
+                        if ip in n:
+                            matched += 1
+                            hits[str(ip)] += 1
+                            samples.setdefault(str(ip), line.rstrip())
+                            break
+        except OSError as e:
+            print(f"пропуск {p}: {e}", file=sys.stderr)
+
+print(f"просканировано строк: {total}, совпадений с сетями РКН/VK: {matched}")
+if not hits:
+    print("обращений из заблокированных сетей в указанных логах не найдено")
+else:
+    print("топ IP:")
+    for ip, cnt in hits.most_common(20):
+        print(f"  {ip:15s} {cnt:6d}   {samples[ip][:160]}")
+PYEOF
+}
+
 case "${1:-}" in
     on)      lock; ensure_deps; cmd_on ;;
     off)     lock; ensure_deps; cmd_off ;;
     status)  cmd_status ;;
     update)  lock; ensure_deps; cmd_update; cmd_status_short ;;
     boot)    lock; cmd_boot ;;
-    *) echo "Использование: rkn-extra-block {on|off|status|update|boot}" >&2; exit 2 ;;
+    log)     lock; ensure_deps; shift; cmd_log "${1:-status}" ;;
+    scan)    shift; cmd_scan "$@" ;;
+    *) echo "Использование: rkn-extra-block {on|off|status|update|boot|log on|off|status|scan [файлы...]}" >&2; exit 2 ;;
 esac
