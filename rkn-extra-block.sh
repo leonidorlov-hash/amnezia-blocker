@@ -382,6 +382,14 @@ else:
 PYEOF
 }
 
+cmd_clearscans() {
+    : > /var/log/rkn-scans.json
+    mkdir -p "$CONF_DIR"
+    date -u +%Y-%m-%dT%H:%M:%SZ > "$CONF_DIR/scanlog.since"
+    log "CLEAR: журнал сканирований обнулён, горизонт сбора перенесён на сейчас"
+    echo "журнал сканирований обнулён (старое из kernel-журнала повторно подхвачено не будет)"
+}
+
 case "${1:-}" in
     on)      lock; ensure_deps; cmd_on ;;
     off)     lock; ensure_deps; cmd_off ;;
@@ -390,5 +398,6 @@ case "${1:-}" in
     boot)    lock; cmd_boot ;;
     log)     lock; ensure_deps; shift; cmd_log "${1:-status}" ;;
     scan)    shift; cmd_scan "$@" ;;
-    *) echo "Использование: rkn-extra-block {on|off|status|update|boot|log on|off|status|scan [файлы...]}" >&2; exit 2 ;;
+    clearscans) lock; cmd_clearscans ;;
+    *) echo "Использование: rkn-extra-block {on|off|status|update|boot|log on|off|status|scan [файлы...]|clearscans}" >&2; exit 2 ;;
 esac

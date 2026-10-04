@@ -9,6 +9,7 @@ set -u
 
 MAP_FILE="/etc/rkn-extra-block/nets.map"
 OUT_FILE="/var/log/rkn-scans.json"
+SINCE_FILE="/etc/rkn-extra-block/scanlog.since"
 MAX_LINES=5000
 LOCK_FILE="/run/rkn-agent.lock"
 
@@ -18,8 +19,10 @@ flock -n 9 || exit 0
 [ -f "$MAP_FILE" ] || exit 0   # списки ещё не подгружались
 
 ts="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+since="-65 minutes"
+[ -f "$SINCE_FILE" ] && since="$(cat "$SINCE_FILE")"
 
-journalctl -k --no-pager --since "-65 minutes" 2>/dev/null | grep "RKN_EXTRA" | \
+journalctl -k --no-pager --since "$since" 2>/dev/null | grep "RKN_EXTRA" | \
 MAP_FILE="$MAP_FILE" TS="$ts" awk '
 function pad(o) { return sprintf("%03d.%03d.%03d.%03d", o[1], o[2], o[3], o[4]) }
 BEGIN {
@@ -58,3 +61,6 @@ if [ "$lines" -gt $MAX_LINES ]; then
     tail -n $MAX_LINES "$OUT_FILE" > "$OUT_FILE.tmp"
     mv "$OUT_FILE.tmp" "$OUT_FILE"
 fi
+
+# Горизонт следующего сбора — от этого момента (старое из journalctl не тянем)
+echo "$ts" > "$SINCE_FILE"
