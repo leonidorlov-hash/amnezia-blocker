@@ -69,7 +69,7 @@ create_set() { # $1=name $2=family(inet|inet6)
 }
 
 # Атомарная перезаливка: скачать, вытащить 'add'-строки, залить в _tmp, swap.
-# При любом провале старый набор остаётся нетронутым.
+# При любом провале старый набор остаётся нетронутым, причина — в лог.
 swap_list() { # $1=url $2=set_name $3=family
     local url="$1" set="$2" family="$3"
     local tmp; tmp=$(mktemp) || die "mktemp"
@@ -87,14 +87,20 @@ swap_list() { # $1=url $2=set_name $3=family
         echo "create ${set}_tmp hash:net family $family maxelem $MAXELEM"
         tr -d '\r' < "$tmp" | grep '^add ' | sed "s|^add [^ ]*|add ${set}_tmp|"
     } > "$restore"
-    create_set "$set" "$family"
+    local cerr
+    cerr=$(ipset create "$set" hash:net "family $family" maxelem $MAXELEM 2>&1) \
+        || log "CREATE-WARN $set: $cerr"
     ipset destroy "${set}_tmp" 2>/dev/null
-    if ! ipset restore -exist < "$restore" 2>/dev/null; then
+    if ! ipset restore -exist < "$restore" 2>>"$LOG_FILE"; then
         log "SWAP-FAIL $set: ipset restore вернул ошибку — старый набор сохранён"
         ipset destroy "${set}_tmp" 2>/dev/null
         rm -f "$tmp" "$restore"; return 1
     fi
-    ipset swap "${set}_tmp" "$set"
+    cerr=$(ipset swap "${set}_tmp" "$set" 2>&1) || {
+        log "SWAP-FAIL $set: $cerr — набор $set не обновлён"
+        ipset destroy "${set}_tmp" 2>/dev/null
+        rm -f "$tmp" "$restore"; return 1
+    }
     ipset destroy "${set}_tmp" 2>/dev/null
     rm -f "$tmp" "$restore"
     log "SWAP-OK $set: $adds сетей"
